@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package demo;
+
+option java_multiple_files = true;
+option java_package = "org.polarmeet.proto";
+
+service HighPerformanceService {
+  rpc Process (Request) returns (Response) {}
+  rpc ProcessStream (stream Request) returns (stream Response) {}
+}
+
+message Request {
+  string data = 1;
+}
+
+message Response {
+  string status = 1;
+}
