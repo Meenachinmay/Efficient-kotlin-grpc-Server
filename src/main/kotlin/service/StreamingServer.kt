@@ -9,7 +9,6 @@ import io.grpc.netty.shaded.io.netty.channel.socket.nio.NioServerSocketChannel
 import io.grpc.stub.StreamObserver
 import kotlinx.coroutines.*
 import kotlinx.coroutines.NonCancellable.isActive
-import kotlinx.coroutines.channels.Channel
 import org.polarmeet.proto.StreamRequest
 import org.polarmeet.proto.StreamResponse
 import org.polarmeet.proto.StreamingServiceGrpc
@@ -21,26 +20,26 @@ import kotlin.time.Duration.Companion.seconds
 class StreamingServer {
     private val server: Server
     private val activeStreams = AtomicInteger(0)
-
-    // Adding counters for monitoring
     private val totalStreamsCreated = AtomicInteger(0)
     private val streamsSinceLastReport = AtomicInteger(0)
 
+    // Virtual thread executor for better scalability
     private val serverDispatcher = Executors.newVirtualThreadPerTaskExecutor().asCoroutineDispatcher()
     private val streamScope = CoroutineScope(serverDispatcher + SupervisorJob())
 
     companion object {
         private const val PORT = 9090
-        private const val MAX_CONCURRENT_STREAMS = 50000
-        private const val WORKER_THREADS = 64
+        private const val MAX_CONCURRENT_STREAMS = 100000
+        private const val WORKER_THREADS = 128
         private const val MONITORING_INTERVAL_SECONDS = 5L
+        private const val QUEUE_CAPACITY = 1000
+        private const val QUEUE_TIMEOUT_MS = 100L
     }
 
     init {
         val bossGroup: EventLoopGroup = NioEventLoopGroup(4)
         val workerGroup: EventLoopGroup = NioEventLoopGroup(WORKER_THREADS)
 
-        // Start the monitoring coroutine
         streamScope.launch {
             monitorStreams()
         }
@@ -59,7 +58,6 @@ class StreamingServer {
         server = builder.build()
     }
 
-    // Monitoring coroutine that prints statistics periodically
     private suspend fun monitorStreams() {
         while (true) {
             delay(MONITORING_INTERVAL_SECONDS.seconds)
@@ -86,7 +84,23 @@ class StreamingServer {
         private val streamsSinceLastReport: AtomicInteger
     ) : StreamingServiceGrpc.StreamingServiceImplBase() {
 
-        private val messageBuffer = Channel<StreamMessage>(Channel.BUFFERED)
+        // Using ArrayBlockingQueue instead of Channel for better performance
+        private val messageBuffer = ArrayBlockingQueue<StreamMessage>(QUEUE_CAPACITY)
+
+        init {
+            // Message producer coroutine
+            scope.launch(Dispatchers.Default) {
+                while (isActive) {
+                    try {
+                        val message = StreamMessage("Sample data ${System.currentTimeMillis()}")
+                        messageBuffer.offer(message, QUEUE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                        delay(100) // Control message production rate
+                    } catch (e: Exception) {
+                        println("Message production error: ${e.message}")
+                    }
+                }
+            }
+        }
 
         override fun streamData(
             request: StreamRequest,
@@ -102,12 +116,10 @@ class StreamingServer {
                 return
             }
 
-            // Update stream counters
             val streamId = totalStreamsCreated.incrementAndGet()
             streamsSinceLastReport.incrementAndGet()
             val currentActive = activeStreams.incrementAndGet()
 
-            // Log new connection
             println("✅ New stream connected (ID: $streamId, Active: $currentActive)")
 
             scope.launch {
@@ -124,19 +136,32 @@ class StreamingServer {
             streamId: Int,
             responseObserver: StreamObserver<StreamResponse>
         ) {
-            val streamChannel = Channel<StreamMessage>(Channel.BUFFERED)
+            // Queue for individual stream messages
+            val streamQueue = ArrayBlockingQueue<StreamMessage>(QUEUE_CAPACITY)
 
             try {
+                // Launch message forwarding coroutine
+                scope.launch {
+                    while (isActive) {
+                        val message = messageBuffer.poll(QUEUE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                        if (message != null) {
+                            streamQueue.offer(message, QUEUE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                        }
+                    }
+                }
+
+                // Process messages from the stream queue
                 while (isActive) {
-                    val message = streamChannel.receive()
+                    val message = streamQueue.poll(QUEUE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                    if (message != null) {
+                        val response = StreamResponse.newBuilder()
+                            .setStreamId(streamId)
+                            .setData(message.data)
+                            .build()
 
-                    val response = StreamResponse.newBuilder()
-                        .setStreamId(streamId)
-                        .setData(message.data)
-                        .build()
-
-                    withContext(Dispatchers.IO) {
-                        responseObserver.onNext(response)
+                        withContext(Dispatchers.IO) {
+                            responseObserver.onNext(response)
+                        }
                     }
                 }
             } catch (e: CancellationException) {
@@ -145,7 +170,6 @@ class StreamingServer {
                 println("❌ Error in stream $streamId: ${e.message}")
                 responseObserver.onError(e)
             } finally {
-                streamChannel.close()
                 responseObserver.onCompleted()
             }
         }
@@ -161,7 +185,4 @@ class StreamingServer {
         """.trimMargin())
     }
 
-    fun blockUntilShutdown() {
-        server.awaitTermination()
-    }
 }
