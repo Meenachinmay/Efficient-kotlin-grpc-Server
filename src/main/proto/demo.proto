@@ -1,19 +1,21 @@
 syntax = "proto3";
 
-package demo;
+package org.polarmeet.proto;
 
 option java_multiple_files = true;
 option java_package = "org.polarmeet.proto";
+option java_outer_classname = "StreamingProto";
 
-service HighPerformanceService {
-  rpc Process (Request) returns (Response) {}
-  rpc ProcessStream (stream Request) returns (stream Response) {}
+service StreamingService {
+  rpc StreamData (StreamRequest) returns (stream StreamResponse) {}
 }
 
-message Request {
-  string data = 1;
+message StreamRequest {
+  string client_id = 1;
 }
 
-message Response {
-  string status = 1;
+message StreamResponse {
+  int32 stream_id = 1;
+  string data = 2;
+  int64 timestamp = 3;
 }
