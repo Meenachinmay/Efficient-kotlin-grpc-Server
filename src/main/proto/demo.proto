@@ -12,6 +12,7 @@ service StreamingService {
 
 message StreamRequest {
   string client_id = 1;
+  int64 connection_timestamp = 2;  // Added for connection timing
 }
 
 message StreamResponse {
