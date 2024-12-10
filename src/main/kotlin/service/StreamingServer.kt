@@ -22,6 +22,7 @@ class StreamingServer {
     private val activeStreams = AtomicInteger(0)
     private val totalStreamsCreated = AtomicInteger(0)
     private val streamsSinceLastReport = AtomicInteger(0)
+    private val receivedClientMessages = AtomicInteger(0)  // Track client messages
 
     // Virtual thread executor for better scalability
     private val serverDispatcher = Executors.newVirtualThreadPerTaskExecutor().asCoroutineDispatcher()
@@ -53,7 +54,7 @@ class StreamingServer {
             .maxInboundMessageSize(1024 * 1024)
             .maxInboundMetadataSize(1024 * 64)
             .flowControlWindow(1024 * 1024 * 8)
-            .addService(StreamingServiceImpl(streamScope, activeStreams, totalStreamsCreated, streamsSinceLastReport))
+            .addService(StreamingServiceImpl(streamScope, activeStreams, totalStreamsCreated, streamsSinceLastReport, receivedClientMessages))
 
         server = builder.build()
     }
@@ -81,7 +82,8 @@ class StreamingServer {
         private val scope: CoroutineScope,
         private val activeStreams: AtomicInteger,
         private val totalStreamsCreated: AtomicInteger,
-        private val streamsSinceLastReport: AtomicInteger
+        private val streamsSinceLastReport: AtomicInteger,
+        private val receivedClientMessages: AtomicInteger
     ) : StreamingServiceGrpc.StreamingServiceImplBase() {
 
         // Using ArrayBlockingQueue instead of Channel for better performance
@@ -103,9 +105,8 @@ class StreamingServer {
         }
 
         override fun streamData(
-            request: StreamRequest,
             responseObserver: StreamObserver<StreamResponse>
-        ) {
+        ): StreamObserver<StreamRequest> {
             if (activeStreams.get() >= MAX_CONCURRENT_STREAMS) {
                 println("❌ Connection rejected: Max streams (${MAX_CONCURRENT_STREAMS}) reached")
                 responseObserver.onError(
@@ -113,7 +114,7 @@ class StreamingServer {
                         .withDescription("Max streams reached")
                         .asException()
                 )
-                return
+                return createNoOpRequestObserver()
             }
 
             val streamId = totalStreamsCreated.incrementAndGet()
@@ -122,26 +123,67 @@ class StreamingServer {
 
             println("✅ New stream connected (ID: $streamId, Active: $currentActive)")
 
+            // Create request observer for client messages
+            val requestObserver = object : StreamObserver<StreamRequest> {
+                override fun onNext(request: StreamRequest) {
+                    receivedClientMessages.incrementAndGet()
+                    println("📥 Received from client $streamId: ${request.message}")
+
+                    // Send acknowledgment response
+                    scope.launch {
+                        val response = StreamResponse.newBuilder()
+                            .setStreamId(streamId)
+                            .setData("Received: ${request.message}")
+                            .setTimestamp(System.currentTimeMillis())
+                            .build()
+                        responseObserver.onNext(response)
+                    }
+                }
+
+                override fun onError(t: Throwable) {
+                    println("❌ Error from client in stream $streamId: ${t.message}")
+                    activeStreams.decrementAndGet()
+                }
+
+                override fun onCompleted() {
+                    println("❎ Stream $streamId completed by client")
+                    activeStreams.decrementAndGet()
+                    responseObserver.onCompleted()
+                }
+            }
+
+            // Launch stream handling
             scope.launch {
                 try {
-                    handleStream(streamId, responseObserver)
+                    handleStream(streamId, responseObserver, requestObserver)
                 } finally {
                     val remainingStreams = activeStreams.decrementAndGet()
                     println("❎ Stream disconnected (ID: $streamId, Remaining: $remainingStreams)")
                 }
             }
+
+            return requestObserver
+        }
+
+        private fun createNoOpRequestObserver(): StreamObserver<StreamRequest> {
+            return object : StreamObserver<StreamRequest> {
+                override fun onNext(value: StreamRequest) {}
+                override fun onError(t: Throwable) {}
+                override fun onCompleted() {}
+            }
         }
 
         private suspend fun handleStream(
             streamId: Int,
-            responseObserver: StreamObserver<StreamResponse>
+            responseObserver: StreamObserver<StreamResponse>,
+            requestObserver: StreamObserver<StreamRequest>
         ) {
             // Queue for individual stream messages
             val streamQueue = ArrayBlockingQueue<StreamMessage>(QUEUE_CAPACITY)
 
             try {
                 // Launch message forwarding coroutine
-                scope.launch {
+                val forwarderJob = scope.launch {
                     while (isActive) {
                         val message = messageBuffer.poll(QUEUE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
                         if (message != null) {
@@ -157,6 +199,7 @@ class StreamingServer {
                         val response = StreamResponse.newBuilder()
                             .setStreamId(streamId)
                             .setData(message.data)
+                            .setTimestamp(System.currentTimeMillis())
                             .build()
 
                         withContext(Dispatchers.IO) {
@@ -164,6 +207,9 @@ class StreamingServer {
                         }
                     }
                 }
+
+                forwarderJob.cancelAndJoin()
+
             } catch (e: CancellationException) {
                 println("⚠️ Stream $streamId cancelled")
             } catch (e: Exception) {
