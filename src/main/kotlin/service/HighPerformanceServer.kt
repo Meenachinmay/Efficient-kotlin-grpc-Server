@@ -8,7 +8,10 @@ import io.grpc.netty.shaded.io.netty.channel.socket.nio.NioServerSocketChannel
 import io.grpc.stub.StreamObserver
 import kotlinx.coroutines.*
 import java.util.concurrent.*
+import java.util.concurrent.atomic.AtomicLong
 import org.jetbrains.exposed.sql.batchInsert
+import org.jetbrains.exposed.sql.exists
+import org.jetbrains.exposed.sql.selectAll
 import org.jetbrains.exposed.sql.transactions.experimental.newSuspendedTransaction
 import org.polarmeet.proto.HighPerformanceServiceGrpc
 import org.polarmeet.proto.Request
@@ -25,8 +28,9 @@ class HighPerformanceServer {
 
     companion object {
         private const val PORT = 9090
-        private const val BATCH_SIZE = 1000
-        private const val BATCH_TIMEOUT_MS = 100L
+        private const val BATCH_SIZE = 5000
+        private const val BATCH_TIMEOUT_MS = 500L
+        private const val NUM_PROCESSORS = 8
     }
 
     init {
@@ -51,15 +55,24 @@ class HighPerformanceServer {
     ) : HighPerformanceServiceGrpc.HighPerformanceServiceImplBase() {
 
         private val okResponse = Response.newBuilder().setStatus("OK").build()
+        private val totalProcessed = AtomicLong(0)
 
-        // Using ArrayBlockingQueue for better performance than Channel
-        private val requestQueue = ArrayBlockingQueue<Request>(100000)
+        // Using larger ArrayBlockingQueue for better performance
+        private val requestQueue = ArrayBlockingQueue<Request>(500000)
 
         init {
             // Start multiple batch processors for parallel processing
-            repeat(4) {
+            repeat(NUM_PROCESSORS) {
                 scope.launch {
                     processBatchInserts()
+                }
+            }
+
+            // Start monitoring coroutine
+            scope.launch {
+                while (true) {
+                    delay(1000)
+                    println("Queue size: ${requestQueue.size}, Total processed: ${totalProcessed.get()}")
                 }
             }
         }
@@ -69,32 +82,34 @@ class HighPerformanceServer {
 
             while (true) {
                 try {
-                    val deadline = System.currentTimeMillis() + BATCH_TIMEOUT_MS
-
-                    // Collect batch using traditional blocking queue
-                    while (batch.size < BATCH_SIZE && System.currentTimeMillis() < deadline) {
-                        val request = withContext(Dispatchers.IO) {
-                            requestQueue.poll(
-                                deadline - System.currentTimeMillis(),
-                                TimeUnit.MILLISECONDS
-                            )
-                        }
-                        if (request != null) {
-                            batch.add(request)
+                    withTimeout(BATCH_TIMEOUT_MS) {
+                        while (batch.size < BATCH_SIZE) {
+                            val request = requestQueue.poll()
+                            if (request != null) {
+                                batch.add(request)
+                            } else {
+                                delay(1) // Small delay if queue is empty
+                            }
                         }
                     }
+                } catch (e: TimeoutCancellationException) {
+                    // Timeout reached, process what we have
+                }
 
-                    if (batch.isNotEmpty()) {
+                if (batch.isNotEmpty()) {
+                    try {
                         newSuspendedTransaction(Dispatchers.IO) {
                             Requests.batchInsert(batch) { request ->
                                 this[Requests.requestData] = request.data
                                 this[Requests.timestamp] = System.currentTimeMillis()
                             }
+                            totalProcessed.addAndGet(batch.size.toLong())
                         }
-                        batch.clear()
+                    } catch (e: Exception) {
+                        println("Batch insert failed: ${e.message}")
+                        e.printStackTrace()
                     }
-                } catch (e: Exception) {
-                    println("Error processing batch: ${e.message}")
+                    batch.clear()
                 }
             }
         }
@@ -103,11 +118,14 @@ class HighPerformanceServer {
             request: Request,
             responseObserver: StreamObserver<Response>
         ) {
+            // Return response immediately
             responseObserver.onNext(okResponse)
             responseObserver.onCompleted()
 
-            // Directly offer to queue instead of launching a new coroutine
-            requestQueue.offer(request)
+            // Add to queue with timeout to prevent blocking
+            if (!requestQueue.offer(request, 100, TimeUnit.MILLISECONDS)) {
+                println("Warning: Request queue full, dropping request")
+            }
         }
     }
 
@@ -123,35 +141,45 @@ class HighPerformanceServer {
 
 fun main() {
     try {
-        // Initialize the database first to ensure connections are ready
-        // This should set up connection pools and verify database access
+        // Initialize and verify database connection
         DatabaseConfig.init()
 
-        // Create runtime shutdown hook to handle graceful shutdown
+        // Verify table existence
+        org.jetbrains.exposed.sql.transactions.transaction {
+            val tableExists = Requests.exists()
+            println("Requests table exists: $tableExists")
+
+            // If table doesn't exist, this will throw an exception
+            Requests.selectAll().limit(1).toList()
+            println("Database connection and table structure verified")
+        }
+
+        // Create runtime shutdown hook
         Runtime.getRuntime().addShutdownHook(Thread {
             println("Shutting down server...")
             try {
-                // Add any cleanup code here if needed
+                // Add cleanup code here if needed
                 println("Server shutdown completed")
             } catch (e: Exception) {
                 println("Error during shutdown: ${e.message}")
+                e.printStackTrace()
             }
         })
 
-        // Create and start the server with error handling
+        // Create and start the server
         val server = HighPerformanceServer()
 
         try {
             server.start()
-            // Block until shutdown is triggered
             server.blockUntilShutdown()
         } catch (e: Exception) {
             println("Failed to start server: ${e.message}")
-            // Perform any necessary cleanup
+            e.printStackTrace()
             System.exit(1)
         }
     } catch (e: Exception) {
         println("Fatal error during server initialization: ${e.message}")
+        e.printStackTrace()
         System.exit(1)
     }
 }
